@@ -35,6 +35,7 @@
 #include "hw/arm/boot.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/display/clarion_du.h"
+#include "trace.h"
 #include "hw/display/clarion_sgx.h"
 #include "hw/misc/clarion_micom.h"
 #include "hw/misc/clarion_dispmicom.h"
@@ -979,7 +980,9 @@ typedef struct Qy8Tmu {
 
 static void qy8_tmu_chan_update_irq(Qy8TmuChan *c)
 {
-    qemu_set_irq(c->irq, (c->tcr & TCR_UNF) && (c->tcr & TCR_UNIE));
+    int level = (c->tcr & TCR_UNF) && (c->tcr & TCR_UNIE);
+    trace_qy8_tmu_irq(level);
+    qemu_set_irq(c->irq, level);
 }
 
 static void qy8_tmu_tick(void *opaque)
@@ -1015,26 +1018,29 @@ static uint64_t qy8_tmu_read(void *opaque, hwaddr addr, unsigned size)
 {
     Qy8Tmu *t = opaque;
     int n;
+    uint64_t ret = 0;
 
     if (addr == TMU_TOCR) {
-        return t->tocr;
-    }
-    if (addr == TMU_TSTR) {
-        return t->tstr;
-    }
-    for (n = 0; n < QY8_TMU_CHANS; n++) {
-        hwaddr b = TMU_CH(n);
-        if (addr == b) {
-            return t->ch[n].tcor;
+        ret = t->tocr;
+    } else if (addr == TMU_TSTR) {
+        ret = t->tstr;
+    } else {
+        for (n = 0; n < QY8_TMU_CHANS; n++) {
+            hwaddr b = TMU_CH(n);
+            if (addr == b) {
+                ret = t->ch[n].tcor;
+            } else if (addr == b + 4) {
+                ret = ptimer_get_count(t->ch[n].ptimer);
+            } else if (addr == b + 8) {
+                ret = t->ch[n].tcr;
+            } else {
+                continue;
+            }
+            break;
         }
-        if (addr == b + 4) {
-            return ptimer_get_count(t->ch[n].ptimer);
-        }
-        if (addr == b + 8) {
-            return t->ch[n].tcr;
-        }
     }
-    return 0;
+    trace_qy8_tmu_read(addr, ret);
+    return ret;
 }
 
 static void qy8_tmu_write(void *opaque, hwaddr addr, uint64_t val,
@@ -1043,6 +1049,7 @@ static void qy8_tmu_write(void *opaque, hwaddr addr, uint64_t val,
     Qy8Tmu *t = opaque;
     int n;
 
+    trace_qy8_tmu_write(addr, val);
     if (addr == TMU_TOCR) {
         t->tocr = val;
         return;
@@ -1652,6 +1659,51 @@ static const MemoryRegionOps qy8_periph_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/* --- RST (Reset/mode-pins) @0xFFCC0000 -------------------------------- */
+
+/*
+ * Linux's rcar_rst_read_mode_pins() reads MODEMR (boot-strap "mode pins")
+ * from this block; drivers/clk/renesas/clk-r8a7778.c then does
+ * BUG_ON(!(mode & BIT(19))) right after. Left as an unimplemented-device
+ * stub (always reads 0), that BUG_ON fires unconditionally -- on ARM that's
+ * a deliberate undefined-instruction trap, which is exactly the "kernel BUG"
+ * /"Attempted to kill the idle task!" panic chain this was causing. Give it
+ * a real, plausible value instead: BIT(19) set (required), everything else
+ * 0 so the PLL-multiplier/divider table lookups in that same driver land on
+ * defined, sane entries (rates[0]={21,21}, every div[0] entry is valid).
+ */
+#define QY8_RST_BASE        0xFFCC0000
+#define QY8_RST_SIZE        0x1000
+#define RST_MODEMR          0x20
+#define QY8_MODEMR_VALUE    0x00080000      /* BIT(19) only */
+
+static uint64_t qy8_rst_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr == RST_MODEMR) {
+        return QY8_MODEMR_VALUE;
+    }
+    qemu_log_mask(LOG_UNIMP, "qy8.rst: read  offset %#" HWADDR_PRIx
+                  " (%u B)\n", addr, size);
+    return 0;
+}
+
+static void qy8_rst_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "qy8.rst: write offset %#" HWADDR_PRIx
+                  " = %#" PRIx64 "\n", addr, val);
+}
+
+static const MemoryRegionOps qy8_rst_ops = {
+    .read = qy8_rst_read,
+    .write = qy8_rst_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 /* --- DBSC3 (DDR3 SDRAM Controller) @0xFE800000 ----------------------- */
 
 /*
@@ -1896,6 +1948,7 @@ struct Qy8MachineState {
     MachineState parent;
 
     ARMCPU *cpu;
+    struct arm_boot_info boot_info;    /* only used with -kernel */
     DeviceState *gic;
     DeviceState *du;
     DeviceState *dmac;
@@ -1917,6 +1970,7 @@ struct Qy8MachineState {
     Qy8Bctl bctl;
     Qy8UsbPhy usbphy;
     Qy8Dbsc3 dbsc3;
+    MemoryRegion rst_mr;
     Qy8Int2Line int2_du;
     Qy8Int2Line int2_sdhi[QY8_NUM_SDHI];
     Qy8Int2Line int2_usb;
@@ -2078,6 +2132,13 @@ static void qy8_init_i2c(Qy8MachineState *s)
     bus = I2C_BUS(qdev_get_child_bus(s->i2c[QY8_I2C_TOUCH], "i2c"));
     if (qy8_is_ze0(s)) {
         ts = i2c_slave_new(TYPE_CY_TMA616, 0x67);
+        /*
+         * Confirmed on a real QY8252NF: a real/scripted tap near the TOP of
+         * the screen hits whatever is drawn near the BOTTOM (e.g. the
+         * telematics consent screen's OK button). The ZE0 driver flips Y
+         * the same way kepdrv does for ZE1/TMA460 below.
+         */
+        qdev_prop_set_bit(DEVICE(ts), "invert-y", true);
     } else {
         ts = i2c_slave_new(TYPE_CY_TMA460, 0x24);
         /* kepdrv flips the driver's Y before posting WM_LBUTTON* */
@@ -2203,6 +2264,23 @@ static void qy8_init(MachineState *machine)
                              &s->ddr1, 0, QY8_DDR1_SIZE);
     memory_region_add_subregion(sysmem, 0x90000000, &s->ddr1_shadow);
 
+    /*
+     * --- Linux direct boot (-kernel/-dtb/-initrd/-append) ---
+     *
+     * For bring-up experiments only: skip loading any flash content here
+     * (no NAND/WinCE dump needed). The CPU reset PC gets overridden to the
+     * kernel entry point by arm_load_kernel() at the end of this function,
+     * once the GIC and all peripherals exist -- see there for the rest.
+     */
+    if (machine->kernel_filename) {
+        if (machine->firmware || s->flash_drive) {
+            error_report("clarion-qy8: -kernel не можна разом із -bios чи "
+                         "-drive if=pflash — обери щось одне");
+            exit(1);
+        }
+        goto skip_flash_load;
+    }
+
     /* --- вміст флеш: дамп плати через -bios --- */
     if (s->flash_drive) {
         /*
@@ -2218,7 +2296,8 @@ static void qy8_init(MachineState *machine)
     } else {
         if (!machine->firmware) {
             error_report("clarion-qy8: треба -bios <дамп флеш 64 МБ> "
-                         "або -drive if=pflash,format=raw,file=<копія>");
+                         "або -drive if=pflash,format=raw,file=<копія>, "
+                         "або -kernel для прямого завантаження Linux");
             exit(1);
         }
         fname = g_strdup(machine->firmware);
@@ -2239,6 +2318,7 @@ static void qy8_init(MachineState *machine)
         }
         g_free(fname);
     }
+skip_flash_load:
 
     /* --- GIC (в A9 R-Car Gen1 він окремий, не в private region) --- */
     s->gic = qdev_new(TYPE_ARM_GIC);
@@ -2587,7 +2667,9 @@ static void qy8_init(MachineState *machine)
     create_unimplemented_device("qy8.intc2", 0xFE780000, 0x1000);
     create_unimplemented_device("qy8.cpg",   0xFFC80000, 0x1000);
     create_unimplemented_device("qy8.pfc",   0xFFFC0000, 0x1000);
-    create_unimplemented_device("qy8.rst",   0xFFCC0000, 0x1000);
+    memory_region_init_io(&s->rst_mr, NULL, &qy8_rst_ops, NULL,
+                          "qy8.rst", QY8_RST_SIZE);
+    memory_region_add_subregion(sysmem, QY8_RST_BASE, &s->rst_mr);
     /* широкий перехоплювач: усе інше згори 0xF0000000 логується */
     /*
      * Широкий перехоплювач: усе інше згори 0xF0000000 логується. Власна
@@ -2631,6 +2713,22 @@ static void qy8_init(MachineState *machine)
                           "qy8.periph", 0x10000000);
     memory_region_add_subregion_overlap(sysmem, 0xF0000000,
                                         &s->periph.mr, -1000);
+
+    /*
+     * -kernel direct boot: everything (GIC, UART, I2C, USB, ...) exists by
+     * now, so load the kernel/dtb/initrd into qy8.ddr0 and point the CPU at
+     * it. See the "goto skip_flash_load" near the top of this function.
+     */
+    if (machine->kernel_filename) {
+        s->boot_info.ram_size = QY8_DDR0_SIZE;
+        s->boot_info.board_id = -1;        /* force DTB boot, no ATAGs */
+        s->boot_info.loader_start = QY8_DDR0_BASE;
+        s->boot_info.kernel_filename = machine->kernel_filename;
+        s->boot_info.kernel_cmdline = machine->kernel_cmdline;
+        s->boot_info.initrd_filename = machine->initrd_filename;
+        s->boot_info.dtb_filename = machine->dtb;
+        arm_load_kernel(s->cpu, machine, &s->boot_info);
+    }
 }
 
 static char *qy8_board_get(Object *obj, Error **errp)

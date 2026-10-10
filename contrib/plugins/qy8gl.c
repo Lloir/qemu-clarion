@@ -536,7 +536,7 @@ static void draw_quad(Proc *p, int count)
                              mv[8 + r] * in[2] + mv[12 + r] * in[3] : in[r];
         }
         if (itc >= 0) {
-            uint32_t t[2];
+            uint32_t t[2] = { 0, 0 };
             rmem(p->attr_ptr[itc] + v * 8, t, 8);
             memcpy(tc[v], t, 8);
         }
